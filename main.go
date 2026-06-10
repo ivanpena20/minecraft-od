@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -31,6 +32,26 @@ func main() {
 	defer listener.Close()
 
 	fmt.Println("minecraft-od v0.1 by ivanpena\nlistening on port 25565...")
+
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			input := scanner.Text() + "\n"
+
+			serverMutex.Lock()
+			if isServerRunning && serverStdin != nil {
+				// Si Java está encendido, le mandamos tu comando (ej: "op ivanpena")
+				serverStdin.Write([]byte(input))
+			} else {
+				// Si está apagado, te avisamos para que no escribas en el vacío
+				fmt.Println("[SYSTEM] Comando ignorado: El servidor Java está apagado.")
+			}
+			serverMutex.Unlock()
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "stdin scanner error: %v\n", err)
+		}
+	}()
 
 	for {
 		conn, err := listener.Accept()
