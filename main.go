@@ -40,11 +40,11 @@ func main() {
 
 			serverMutex.Lock()
 			if isServerRunning && serverStdin != nil {
-				// Si Java está encendido, le mandamos tu comando (ej: "op ivanpena")
+				// if server is running, send the command (ej: "op ivanpena")
 				serverStdin.Write([]byte(input))
 			} else {
-				// Si está apagado, te avisamos para que no escribas en el vacío
-				fmt.Println("[SYSTEM] Comando ignorado: El servidor Java está apagado.")
+				// If the server is offline, notify the user not to write to the void
+				fmt.Println("[SYSTEM] Command ignored: The Java server is offline.")
 			}
 			serverMutex.Unlock()
 		}
