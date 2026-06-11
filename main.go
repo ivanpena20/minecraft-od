@@ -3,24 +3,41 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-const (
-	ManagerPort = "0.0.0.0:25565"
-	BackendAddr = "127.0.0.1:25566"
-	JarPath     = "/home/ivan/server"
-	JarFile     = "paper.jar"
-	JavaXms     = "-Xms2G"
-	JavaXmx     = "-Xmx2G"
-	IdleMinutes = 20
-)
+type MessagesConfig struct {
+	MotdOffline  string   `json:"motd_offline"`
+	OfflineHover []string `json:"offline_hover"`
+	BootingUp    string   `json:"booting_up"`
+	WorldLoading string   `json:"world_loading"`
+}
+
+type Config struct {
+	ManagerPort string         `json:"manager_port"`
+	BackendAddr string         `json:"backend_addr"`
+	JarPath     string         `json:"jar_path"`
+	JarFile     string         `json:"jar_file"`
+	JavaArgs    string         `json:"java_args"`
+	IdleMinutes int            `json:"idle_minutes"`
+	Messages    MessagesConfig `json:"messages"`
+}
 
 var (
 	isServerRunning bool
@@ -30,17 +47,173 @@ var (
 	activePlayers int
 	activeMutex   sync.Mutex
 	shutdownTimer *time.Timer
+
+	// Config and flags
+	cfg        Config
+	configPath = flag.String("config", "config.json", "Path to the configuration file")
+	verbose    = flag.Bool("verbose", false, "Enable verbose logging")
+	jarPathArg = flag.String("jarpath", "", "Path to the server directory (overrides config)")
+	jarFileArg = flag.String("jarfile", "", "Server executable jar file (overrides config)")
+	portArg    = flag.String("port", "", "Manager port to listen on (overrides config)")
 )
 
-func main() {
-	listener, err := net.Listen("tcp", ManagerPort)
+// logInfo: prints standard information
+func logInfo(format string, a ...interface{}) {
+	fmt.Printf(format+"\n", a...)
+}
+
+// logVerbose: prints only if verbose flag is set
+func logVerbose(format string, a ...interface{}) {
+	if *verbose {
+		fmt.Printf("[DEBUG] "+format+"\n", a...)
+	}
+}
+
+// loadConfig: reads config.json or creates a default one
+func loadConfig() {
+	defaultConfig := Config{
+		ManagerPort: "0.0.0.0:25565",
+		BackendAddr: "127.0.0.1:25566",
+		JarPath:     "/home/ivan/server",
+		JarFile:     "server.jar",
+		JavaArgs:    "-Xms2G -Xmx2G",
+		IdleMinutes: 20,
+		Messages: MessagesConfig{
+			MotdOffline:  "§e[minecraft-od] §7Status: §cSleeping\n§7Join the server to start it up",
+			OfflineHover: []string{
+				"§cServer is sleeping",
+				"§aJoin to wake it up!",
+			},
+			BootingUp:    "§e[Minecraft on Demand] §fThe server is booting up.\n§7Please wait a moment and try again.",
+			WorldLoading: "§e[Minecraft on Demand] §fThe world is still loading.\n§7Give it just a few more seconds.",
+		},
+	}
+
+	data, err := os.ReadFile(*configPath)
 	if err != nil {
-		fmt.Printf("Failed to bind port 25565: %v\n", err)
+		if os.IsNotExist(err) {
+			logInfo("[SYSTEM] Config file %s not found. Creating default...", *configPath)
+			data, _ = json.MarshalIndent(defaultConfig, "", "  ")
+			os.WriteFile(*configPath, data, 0644)
+			cfg = defaultConfig
+		} else {
+			logInfo("[SYSTEM ERROR] Failed to read config: %v", err)
+			os.Exit(1)
+		}
+	} else {
+		err = json.Unmarshal(data, &cfg)
+		if err != nil {
+			logInfo("[SYSTEM ERROR] Failed to parse config JSON: %v", err)
+			os.Exit(1)
+		}
+	}
+
+	// Override with command line arguments
+	if *jarPathArg != "" {
+		cfg.JarPath = *jarPathArg
+	}
+	if *jarFileArg != "" {
+		cfg.JarFile = *jarFileArg
+	}
+	if *portArg != "" {
+		cfg.ManagerPort = *portArg
+	}
+}
+
+func escapeJSONString(s string) string {
+	// Escape newlines for valid JSON string payload
+	return strings.ReplaceAll(s, "\n", "\\n")
+}
+
+func resizeTo64x64(src image.Image) image.Image {
+	bounds := src.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+
+	if width == 64 && height == 64 {
+		return src
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			srcX := x * width / 64
+			srcY := y * height / 64
+			dst.Set(x, y, src.At(bounds.Min.X+srcX, bounds.Min.Y+srcY))
+		}
+	}
+	return dst
+}
+
+func getOfflineFavicon() string {
+	iconPath := filepath.Join(cfg.JarPath, "server-icon.png")
+	file, err := os.Open(iconPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		logVerbose("Failed to decode server-icon.png: %v", err)
+		return ""
+	}
+
+	resized := resizeTo64x64(img)
+
+	var buf bytes.Buffer
+	err = png.Encode(&buf, resized)
+	if err != nil {
+		logVerbose("Failed to encode resized server icon: %v", err)
+		return ""
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(buf.Bytes())
+	return fmt.Sprintf(`,"favicon": "data:image/png;base64,%s"`, b64)
+}
+
+func generateHoverJSON() string {
+	var hovers []string
+	for i, line := range cfg.Messages.OfflineHover {
+		id := fmt.Sprintf("00000000-0000-0000-0000-%012d", i)
+		hovers = append(hovers, fmt.Sprintf(`{"name": "%s", "id": "%s"}`, escapeJSONString(line), id))
+	}
+	return strings.Join(hovers, ",")
+}
+
+func main() {
+	flag.Parse()
+	loadConfig()
+
+	listener, err := net.Listen("tcp", cfg.ManagerPort)
+	if err != nil {
+		logInfo("Failed to bind port %s: %v", cfg.ManagerPort, err)
 		os.Exit(1)
 	}
 	defer listener.Close()
 
-	fmt.Printf("minecraft-od v0.1 by ivanpena\nlistening on %s...\n", ManagerPort)
+	logInfo("minecraft-od v0.2 by ivanpena")
+	logInfo("listening on %s...", cfg.ManagerPort)
+
+	// shutdown protection
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logInfo("\n[SYSTEM] Closing safely...")
+		
+		serverMutex.Lock()
+		if isServerRunning && serverStdin != nil {
+			logInfo("[SYSTEM] Stopping server gracefully before exit...")
+			serverStdin.Write([]byte("stop\n"))
+			serverMutex.Unlock()
+			
+			time.Sleep(15 * time.Second)	// 15 sec for chunks to save
+		} else {
+			serverMutex.Unlock()
+		}
+		os.Exit(0)
+	}()
 
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
@@ -53,7 +226,7 @@ func main() {
 				serverStdin.Write([]byte(input))
 			} else {
 				// Warn if someone tries to run a command while the server sleeps
-				fmt.Println("[SYSTEM] Command ignored: The server is offline.")
+				logInfo("[SYSTEM] Command ignored: The server is offline.")
 			}
 			serverMutex.Unlock()
 		}
@@ -73,7 +246,7 @@ func main() {
 
 // handleConnection: routes the traffic based on the Handshake
 func handleConnection(conn net.Conn) {
-	defer conn.Close()  // close
+	defer conn.Close() // close
 
 	// 3-second read deadline prevents scanner bots from hanging this thread indefinitely.
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -106,23 +279,24 @@ func handleConnection(conn net.Conn) {
 		// Lift the read deadline now that we know the player's intent, otherwise they'd disconnect mid-game
 		conn.SetReadDeadline(time.Time{})
 
+		// Proxy if the server is running, for both ping (1) and join (2)
+		if isServerRunning {
+			handleProxy(conn, protocolVersion, serverAddress, portBuf, nextState)
+			return
+		}
+
 		switch nextState {
 		case 1:
-			// menu refresh/ping
+			// menu refresh/ping (server is offline)
 			handleStatus(conn)
 		case 2:
-			// join server
-			if isServerRunning {
-				// Reconstruct the handshake and proxy the connection if the server is up
-				handleProxy(conn, protocolVersion, serverAddress, portBuf)
-			} else {
-				handleLoginKick(conn, protocolVersion)
-			}
+			// join server (server is offline)
+			handleLoginKick(conn, protocolVersion)
 		}
 	}
 }
 
-// handleStatus: handles the status request and response (ping/pong)
+// handleStatus: handles the offline status request and response
 func handleStatus(conn net.Conn) {
 	// Enforce a deadline so ping requests don't block forever if the client drops
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -131,32 +305,18 @@ func handleStatus(conn net.Conn) {
 	_, _ = ReadVarInt(conn)
 	_, _ = ReadVarInt(conn)
 
-	var jsonResponse string
+	faviconJSON := getOfflineFavicon()
+	hoverJSON := generateHoverJSON()
 
-	if isServerRunning {
-		// Server is active, display online players
-		activeMutex.Lock()
-		players := activePlayers
-		activeMutex.Unlock()
-
-		jsonResponse = fmt.Sprintf(`{
-			"version": { "name": "26.1.2", "protocol": 775 },
-			"players": { "max": 20, "online": %d },
-			"description": { "text": "§a[Minecraft-OD] §7Status: §aOnline\n§7Server is ready!" }
-		}`, players)
-	} else {
-		// Server is asleep, hide player max to indicate offline status
-		jsonResponse = `{
-			"version": { "name": "§cOffline", "protocol": -1 }, 
-			"players": { "max": 0, "online": 0,
-				"sample": [
-					{"name": "§cServer is sleeping", "id": "00000000-0000-0000-0000-000000000000"},
-					{"name": "§aJoin to wake it up!", "id": "00000000-0000-0000-0000-000000000001"}
-				]
-			},
-			"description": { "text": "§e[Minecraft-OD] §7Status: §cSleeping\n§7Join the server to start it up" }
-		}`
-	}
+	// Server is asleep, hide player max to indicate offline status
+	jsonResponse := fmt.Sprintf(`{
+		"version": { "name": "§cOffline", "protocol": -1 }, 
+		"players": { "max": 0, "online": 0,
+			"sample": [%s]
+		},
+		"description": { "text": "%s" }
+		%s
+	}`, hoverJSON, escapeJSONString(cfg.Messages.MotdOffline), faviconJSON)
 
 	WriteStatusResponse(conn, jsonResponse)
 
@@ -184,10 +344,10 @@ func handleStatus(conn net.Conn) {
 
 // handleLoginKick: kicks the player and starts the server
 func handleLoginKick(conn net.Conn, protocolVersion int) {
-	fmt.Printf("--> Player from %s attempted to join! (Protocol: %d)\n", conn.RemoteAddr().String(), protocolVersion)
+	logInfo("--> Player from %s attempted to join! (Protocol: %d)", conn.RemoteAddr().String(), protocolVersion)
 
 	// kick player and show message
-	jsonMsg := `{"text": "§e[Minecraft on Demand] §fThe server is booting up.\n§7Please wait ~40 seconds and try again."}`
+	jsonMsg := fmt.Sprintf(`{"text": "%s"}`, escapeJSONString(cfg.Messages.BootingUp))
 	WriteDisconnectPacket(conn, jsonMsg)
 
 	// tcp half close
@@ -204,13 +364,15 @@ func handleLoginKick(conn net.Conn, protocolVersion int) {
 	serverMutex.Unlock()
 }
 
-func handleProxy(clientConn net.Conn, protocolVersion int, serverAddress string, portBuf []byte) {
+func handleProxy(clientConn net.Conn, protocolVersion int, serverAddress string, portBuf []byte, nextState int) {
 	// rebuild initial handshake
 
-	backendConn, err := net.Dial("tcp", BackendAddr)
+	backendConn, err := net.Dial("tcp", cfg.BackendAddr)
 	if err != nil {
-		jsonMsg := `{"text": "§e[Minecraft on Demand] §fThe world is still loading.\n§7Give it just a few more seconds."}`
-		WriteDisconnectPacket(clientConn, jsonMsg)
+		if nextState == 2 {
+			jsonMsg := fmt.Sprintf(`{"text": "%s"}`, escapeJSONString(cfg.Messages.WorldLoading))
+			WriteDisconnectPacket(clientConn, jsonMsg)
+		}
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
 		}
@@ -228,29 +390,36 @@ func handleProxy(clientConn net.Conn, protocolVersion int, serverAddress string,
 	handshake.Write(addrBytes)
 
 	handshake.Write(portBuf)
-	WriteVarIntToBuffer(&handshake, 2)
+	WriteVarIntToBuffer(&handshake, nextState)
 
-	WriteVarInt(backendConn, handshake.Len())
-	backendConn.Write(handshake.Bytes())
+	// Combine length and handshake payload into a single buffer to avoid TCP fragmentation delay
+	var finalHandshake bytes.Buffer
+	WriteVarIntToBuffer(&finalHandshake, handshake.Len())
+	finalHandshake.Write(handshake.Bytes())
+	backendConn.Write(finalHandshake.Bytes())
 
-	activeMutex.Lock()
-	activePlayers++
-	if shutdownTimer != nil {
-		fmt.Println("[SYSTEM] Player joined. Canceling shutdown timer.")
-		shutdownTimer.Stop()
-		shutdownTimer = nil
-	}
-	activeMutex.Unlock()
-
-	defer func() {
-		fmt.Printf("[SYSTEM] Player %s disconnected.\n", clientConn.RemoteAddr().String())
+	if nextState == 2 {
 		activeMutex.Lock()
-		activePlayers--
-		// Start the idle timer only if the last player leaves
-		if activePlayers == 0 && isServerRunning {
-			startCountdown()
+		activePlayers++
+		if shutdownTimer != nil {
+			logVerbose("[SYSTEM] Player joined. Canceling shutdown timer.")
+			shutdownTimer.Stop()
+			shutdownTimer = nil
 		}
 		activeMutex.Unlock()
+	}
+
+	defer func() {
+		if nextState == 2 {
+			logVerbose("[SYSTEM] Player %s disconnected.", clientConn.RemoteAddr().String())
+			activeMutex.Lock()
+			activePlayers--
+			// Start the idle timer only if the last player leaves
+			if activePlayers == 0 && isServerRunning {
+				startCountdown()
+			}
+			activeMutex.Unlock()
+		}
 	}()
 
 	// Pipe the connection bi-directionally
@@ -261,9 +430,9 @@ func handleProxy(clientConn net.Conn, protocolVersion int, serverAddress string,
 }
 
 func startCountdown() {
-	fmt.Printf("[SYSTEM] No players online. Starting %d-minute shutdown timer...\n", IdleMinutes)
+	logInfo("[SYSTEM] No players online. Starting %d-minute shutdown timer...", cfg.IdleMinutes)
 
-	shutdownTimer = time.AfterFunc(time.Duration(IdleMinutes)*time.Minute, func() {
+	shutdownTimer = time.AfterFunc(time.Duration(cfg.IdleMinutes)*time.Minute, func() {
 		activeMutex.Lock()
 		if activePlayers > 0 {
 			// A player joined right as the timer triggered, abort shutdown
@@ -274,7 +443,7 @@ func startCountdown() {
 
 		serverMutex.Lock()
 		if isServerRunning && serverStdin != nil {
-			fmt.Println("[SYSTEM] Idle timer reached. Stopping server gracefully...")
+			logInfo("[SYSTEM] Idle timer reached. Stopping server gracefully...")
 			serverStdin.Write([]byte("stop\n"))
 		}
 		serverMutex.Unlock()
@@ -282,10 +451,16 @@ func startCountdown() {
 }
 
 func startServer() {
-	fmt.Println("[SYSTEM] Executing Java process...")
+	logInfo("[SYSTEM] Executing Java process...")
 
-	cmd := exec.Command("java", JavaXms, JavaXmx, "-jar", JarFile, "nogui")
-	cmd.Dir = JarPath
+	// Split java_args by spaces to support multiple arguments
+	args := strings.Fields(cfg.JavaArgs)
+	args = append(args, "-jar", cfg.JarFile, "nogui")
+	
+	logVerbose("Running command: java %v in %s", args, cfg.JarPath)
+
+	cmd := exec.Command("java", args...)
+	cmd.Dir = cfg.JarPath
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -293,20 +468,20 @@ func startServer() {
 	var err error
 	serverStdin, err = cmd.StdinPipe()
 	if err != nil {
-		fmt.Printf("[SYSTEM ERROR] Failed to create stdin pipe: %v\n", err)
+		logInfo("[SYSTEM ERROR] Failed to create stdin pipe: %v", err)
 		return
 	}
 
 	err = cmd.Start()
 	if err != nil {
-		fmt.Printf("[SYSTEM ERROR] Failed to start server: %v\n", err)
+		logInfo("[SYSTEM ERROR] Failed to start server: %v", err)
 		serverMutex.Lock()
 		isServerRunning = false
 		serverMutex.Unlock()
 		return
 	}
 
-	fmt.Println("[SYSTEM] Server process launched in background!")
+	logInfo("[SYSTEM] Server process launched in background!")
 
 	activeMutex.Lock()
 	if activePlayers == 0 {
@@ -316,7 +491,7 @@ func startServer() {
 
 	go func() {
 		cmd.Wait()
-		fmt.Println("[SYSTEM] Server has STOPPED.")
+		logInfo("[SYSTEM] Server has STOPPED.")
 
 		serverMutex.Lock()
 		isServerRunning = false

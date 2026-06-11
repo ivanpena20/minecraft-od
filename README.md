@@ -16,3 +16,10 @@ It basically works by reading the packet the minecraft client sends to the serve
 - added comments
 - fixed console input
 
+### v0.2 (2026-06-11)
+- revamped tcp connection handler
+- added shutdown/ctrl-c protection
+- added configuration
+- made online motd passthrough
+- server-icon support
+

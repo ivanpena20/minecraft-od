@@ -100,8 +100,12 @@ func WriteStatusResponse(conn net.Conn, json string) {
 	WriteVarIntToBuffer(&packetData, len(jsonBytes))
 	packetData.Write(jsonBytes)
 
-	WriteVarInt(conn, packetData.Len()) // write packet length
-	conn.Write(packetData.Bytes())     //send packet
+	// Combine length and payload into a single buffer to avoid TCP fragmentation delay
+	var finalPacket bytes.Buffer
+	WriteVarIntToBuffer(&finalPacket, packetData.Len())
+	finalPacket.Write(packetData.Bytes())
+
+	conn.Write(finalPacket.Bytes()) // send complete packet at once
 }
 
 // WritePongPacket: sends the exact timestamp back to the client to measure latency
@@ -110,8 +114,11 @@ func WritePongPacket(conn net.Conn, payload []byte) {
 	WriteVarIntToBuffer(&packetData, 0x01) // 0x01 = pong packet id
 	packetData.Write(payload)              // Append the 8 bytes of time data
 
-	WriteVarInt(conn, packetData.Len())    // write packet length
-	conn.Write(packetData.Bytes())         //send packet
+	var finalPacket bytes.Buffer
+	WriteVarIntToBuffer(&finalPacket, packetData.Len())
+	finalPacket.Write(packetData.Bytes())
+
+	conn.Write(finalPacket.Bytes()) // send complete packet at once
 }
 
 // WriteDisconnectPacket: sends a kick message to the player during login
@@ -124,7 +131,9 @@ func WriteDisconnectPacket(conn net.Conn, jsonReason string) {
 	WriteVarIntToBuffer(&packetData, len(jsonBytes))
 	packetData.Write(jsonBytes)
 
-	// send total packet length, then data
-	WriteVarInt(conn, packetData.Len())
-	conn.Write(packetData.Bytes())
+	var finalPacket bytes.Buffer
+	WriteVarIntToBuffer(&finalPacket, packetData.Len())
+	finalPacket.Write(packetData.Bytes())
+
+	conn.Write(finalPacket.Bytes()) // send complete packet at once
 }

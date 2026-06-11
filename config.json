@@ -1,0 +1,17 @@
+{
+  "manager_port": "0.0.0.0:25565",
+  "backend_addr": "127.0.0.1:25566",
+  "jar_path": "/home/ivan/server",
+  "jar_file": "paper.jar",
+  "java_args": "-Xms2G -Xmx2G",
+  "idle_minutes": 20,
+  "messages": {
+    "motd_offline": "§e[Minecraft on Demand] §7Status: §cSleeping\n§7Join the server to start it up",
+    "offline_hover": [
+      "§cServer is sleeping...",
+      "§aJoin to wake it up"
+    ],
+    "booting_up": "§e[Minecraft on Demand] §fThe server is booting up.\n§7Please wait a moment and try again.",
+    "world_loading": "§e[Minecraft on Demand] §fThe world is still loading.\n§7Give it just a few more seconds."
+  }
+}
